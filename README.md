@@ -1,5 +1,7 @@
 # Agentic RAG
 
+[![CI](https://github.com/muralikarlapalem-cmd/agentic-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/muralikarlapalem-cmd/agentic-rag/actions/workflows/ci.yml)
+
 PDF-first RAG with an agentic fallback. Upload a PDF and ask questions. If the PDF
 answers it, you get a cited answer from the PDF only. If not, a LangChain tool-calling
 agent picks between **Tavily** (web), **Wikipedia** and **arXiv**. The badge on each
@@ -79,12 +81,25 @@ Without SSM: create `.env` from `.env.example` (`chmod 600 .env`) and run
 | Logs | `sudo docker compose logs -f app` |
 | Update | `git pull && sudo ./deploy/setup-ec2.sh --ssm-prefix /agentic-rag --domain <host>` |
 | Roll back | `git checkout <previous-commit>` then re-run the script |
-| Status | `sudo docker compose ps` (look for `healthy`) |
+| Status | `sudo docker compose --profile https ps` (look for `healthy`) |
+| Start anything stopped | `sudo docker compose --profile https up -d` |
 | Rotate a key | `aws ssm put-parameter --overwrite ...` then re-run the script |
 
 Set a monthly **spend limit in the OpenAI dashboard** as a backstop to the in-app
 rate limit. Indexes in the `rag-data` volume can be rebuilt by re-uploading the PDF,
 so they are not backed up.
+
+### Stopping and starting the instance
+To save money, stop the instance from the EC2 console when you're not using it
+(**Instance state → Stop**) and start it again later (**Instance state → Start**).
+Nothing else is needed:
+
+- Docker starts at boot and both containers use `restart: unless-stopped`, so the app and
+  Caddy come back on their own 1–2 minutes after the instance shows *Running*.
+- The Elastic IP keeps the same address; the loaded PDF and the HTTPS certificate are kept
+  in Docker volumes.
+- Don't run `docker compose stop` or `down` first: containers stopped that way stay stopped.
+  If the site isn't up after 5 minutes, run `sudo docker compose --profile https up -d`.
 
 ### Private access without a domain
 Run `sudo ./deploy/setup-ec2.sh --ssm-prefix /agentic-rag` (no `--domain`). The app listens
