@@ -99,4 +99,8 @@ http://localhost:8501. Don't expose it over plain HTTP: the password would trave
 - The agent must call a tool. If it doesn't, the answer is labelled "No Source" with a warning.
 - Without a Tavily key, web search is disabled (Wikipedia and arXiv only).
 - Scanned (image-only) PDFs are rejected with a message; run OCR first.
+- The 5 nearest chunks are retrieved, but only those within 0.15 of the best score are sent
+  to the model. The chunks panel shows each chunk's score and whether it was sent.
+- Answers render as Markdown (bold, lists, links). Raw HTML from the model or tools is never rendered.
+- **Remove PDF** in the sidebar unloads the document and deletes its saved index from the server.
 - One active PDF per server (the most recent). Multi-user isolation is out of scope.
