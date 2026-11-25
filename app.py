@@ -19,6 +19,7 @@ import html
 import json
 import logging
 import os
+import shutil
 import tempfile
 import textwrap
 import threading
@@ -58,6 +59,9 @@ DEFAULT_CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 TOP_K = 5
+# A retrieved chunk is sent to the LLM only if it scores within this margin of
+# the best chunk. Distant chunks add tokens and can mislead the answer.
+CHUNK_MARGIN = 0.15
 # Cosine similarity cut-off for "the PDF probably covers this". Tuned for
 # text-embedding-3-small, where on-topic chunks usually score ~0.35-0.65 and
 # unrelated ones fall below ~0.25. Adjustable in the sidebar.
@@ -193,6 +197,26 @@ CSS = """
     /* ── Misc ── */
     .divider { border-top: 1px solid #1e293b; margin: 1rem 0; }
     div[data-testid="stExpander"] { background: #161b27; border: 1px solid #2d3748; border-radius: 8px; }
+    /* ── Answer bubbles: st.container(key="bot-<source>-<n>") ── */
+    [class*="st-key-bot-"] {
+        background: #0d1f3c;
+        border: 1px solid #1e3a5f;
+        border-left: 3px solid #3b82f6;
+        border-radius: 2px 12px 12px 12px;
+        padding: 14px 16px;
+        gap: 0.4rem;
+    }
+    [class*="st-key-bot-pdf-"]   { border-left-color: #10b981; }
+    [class*="st-key-bot-web-"]   { border-left-color: #f59e0b; }
+    [class*="st-key-bot-wiki-"]  { border-left-color: #8b5cf6; }
+    [class*="st-key-bot-arxiv-"] { border-left-color: #ef4444; }
+    [class*="st-key-bot-mixed-"] { border-left-color: #06b6d4; }
+    [class*="st-key-bot-"] p, [class*="st-key-bot-"] li { font-size: 0.95rem; line-height: 1.65; }
+    [class*="st-key-bot-"] a { color: #7dd3fc; }
+    .chunk-card.unused { opacity: 0.55; border-style: dashed; }
+    .chunk-tag { float: right; font-size: 0.7rem; }
+    .chunk-tag.used { color: #6ee7b7; }
+    .chunk-tag.unused { color: #94a3b8; }
     </style>
 """
 
@@ -269,7 +293,7 @@ def index_pdf_cached(pdf_bytes: bytes, name: str, embeddings) -> FAISS:
         return load_and_index_pdf(pdf_bytes, embeddings)
 
 
-def load_last_index(embeddings) -> Optional[tuple[FAISS, str]]:
+def load_last_index(embeddings) -> Optional[tuple[FAISS, str, str]]:
     """Restore the most recently used PDF index after a restart, if there is one."""
     try:
         meta = json.loads((DATA_DIR / "last.json").read_text())
@@ -278,9 +302,21 @@ def load_last_index(embeddings) -> Optional[tuple[FAISS, str]]:
             return None
         # The pickle is read only from DATA_DIR, which this app alone writes.
         store = FAISS.load_local(str(path), embeddings, allow_dangerous_deserialization=True)
-        return store, meta["name"]
+        return store, meta["name"], meta["digest"]
     except (OSError, ValueError, KeyError):
         return None
+
+
+def remove_index(digest: Optional[str]) -> None:
+    """Delete a PDF's saved index and forget it as the last-used document."""
+    if digest:
+        shutil.rmtree(_index_dir(digest), ignore_errors=True)
+    last = DATA_DIR / "last.json"
+    try:
+        if not digest or json.loads(last.read_text()).get("digest") == digest:
+            last.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        last.unlink(missing_ok=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -389,13 +425,36 @@ def l2_to_cosine(squared_l2: float) -> float:
 
 
 def retrieve_from_pdf(query: str, store: FAISS) -> tuple[list[Document], float]:
-    """Return the top-K chunks and the best cosine similarity among them."""
+    """
+    Return the top-K chunks, best first, each carrying its cosine similarity in
+    metadata["score"], plus the best score. Copies are returned so the stored
+    documents are never modified.
+    """
     hits = store.similarity_search_with_score(query, k=TOP_K)
     if not hits:
         return [], 0.0
-    docs = [d for d, _ in hits]
-    best = max(l2_to_cosine(s) for _, s in hits)
-    return docs, best
+    docs = [
+        Document(page_content=d.page_content, metadata={**d.metadata, "score": l2_to_cosine(s)})
+        for d, s in hits
+    ]
+    docs.sort(key=lambda d: d.metadata["score"], reverse=True)
+    return docs, docs[0].metadata["score"]
+
+
+def select_context(docs: list[Document], margin: float = CHUNK_MARGIN) -> list[Document]:
+    """
+    Keep only chunks scoring within `margin` of the best one; the best chunk is
+    always kept. Kept chunks are marked metadata["used"]=True for the UI.
+    """
+    if not docs:
+        return []
+    best = max(d.metadata.get("score", 0.0) for d in docs)
+    kept = []
+    for d in docs:
+        d.metadata["used"] = d.metadata.get("score", 0.0) >= best - margin
+        if d.metadata["used"]:
+            kept.append(d)
+    return kept
 
 
 def format_pdf_context(docs: list[Document]) -> str:
@@ -547,7 +606,7 @@ def orchestrate(
 
         if chunks and relevance >= threshold:
             try:
-                ok, answer = answer_from_pdf(query, chunks, llm)
+                ok, answer = answer_from_pdf(query, select_context(chunks), llm)
             except Exception as exc:
                 log.exception("PDF answer failed")
                 result["note"] = f"PDF answering failed ({exc}); trying external tools."
@@ -598,29 +657,50 @@ SOURCE_META = {
 }
 
 
-def render_message(role: str, text: str, source: str = "none"):
-    safe = html.escape(text).replace("\n", "<br>")
+def answer_markdown(text: str) -> str:
+    """
+    Prepare model output for st.markdown. Raw HTML is never enabled for answers,
+    so tool results cannot inject markup; '$' is escaped so prices are not
+    rendered as LaTeX maths.
+    """
+    return text.replace("$", "\\$")
+
+
+def render_message(role: str, text: str, source: str = "none", idx: int = 0):
     if role == "user":
+        safe = html.escape(text).replace("\n", "<br>")
         st.markdown(f'<div class="msg-user">👤 {safe}</div>', unsafe_allow_html=True)
         return
-    label, badge_cls, bubble_cls = SOURCE_META.get(source, SOURCE_META["none"])
-    st.markdown(
-        f'<div class="{bubble_cls}"><span class="source-badge {badge_cls}">⬤ {label}</span>'
-        f"<br>{safe}</div>",
-        unsafe_allow_html=True,
-    )
+    if source not in SOURCE_META:
+        source = "none"
+    label, badge_cls, _ = SOURCE_META[source]
+    with st.container(key=f"bot-{source}-{idx}"):
+        st.markdown(f'<span class="source-badge {badge_cls}">⬤ {label}</span>',
+                    unsafe_allow_html=True)
+        st.markdown(answer_markdown(text))
 
 
 def render_chunks(chunks: list[Document], relevance: float):
     if not chunks:
         return
-    with st.expander(f"📄 Retrieved PDF chunks (best similarity: {relevance:.2f})"):
+    used = sum(1 for d in chunks if d.metadata.get("used", True))
+    title = (f"📄 Retrieved PDF chunks: {used} of {len(chunks)} sent to the model "
+             f"(best similarity {relevance:.2f})")
+    with st.expander(title):
+        st.caption(f"Chunks scoring more than {CHUNK_MARGIN:.2f} below the best match "
+                   "are shown but not sent to the model.")
         for i, doc in enumerate(chunks, 1):
             page = doc.metadata.get("page")
             page_label = page + 1 if isinstance(page, int) else "?"
+            score = doc.metadata.get("score")
+            score_txt = f" · similarity {score:.2f}" if isinstance(score, float) else ""
+            is_used = doc.metadata.get("used", True)
+            tag = ('<span class="chunk-tag used">sent to model</span>' if is_used
+                   else '<span class="chunk-tag unused">not sent</span>')
             preview = html.escape(textwrap.shorten(doc.page_content, width=600, placeholder="…"))
             st.markdown(
-                f'<div class="chunk-card"><div class="chunk-meta">Chunk {i} · Page {page_label}</div>'
+                f'<div class="chunk-card{"" if is_used else " unused"}">'
+                f'<div class="chunk-meta">Chunk {i} · Page {page_label}{score_txt}{tag}</div>'
                 f"{preview}</div>",
                 unsafe_allow_html=True,
             )
@@ -643,8 +723,8 @@ def main():
     st.set_page_config(page_title="Agentic RAG", page_icon="🔍", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
 
-    for k, v in {"vector_store": None, "pdf_key": None, "pdf_name": None,
-                 "history": [], "restore_tried": False}.items():
+    for k, v in {"vector_store": None, "pdf_key": None, "pdf_name": None, "pdf_digest": None,
+                 "history": [], "restore_tried": False, "uploader_key": 0}.items():
         st.session_state.setdefault(k, v)
 
     if not password_gate():
@@ -674,9 +754,18 @@ def main():
             st.caption("No Tavily key: web search is disabled (Wikipedia + arXiv only).")
         if pdf_ok:
             st.caption(f"📄 {st.session_state.pdf_name}")
+            if st.button("✕ Remove PDF", use_container_width=True,
+                         help="Unload this PDF and delete its saved index from the server."):
+                remove_index(st.session_state.pdf_digest)
+                st.session_state.update(vector_store=None, pdf_key=None, pdf_name=None,
+                                        pdf_digest=None, history=[],
+                                        uploader_key=st.session_state.uploader_key + 1)
+                st.rerun()
 
         st.markdown('<p class="sidebar-label">Upload PDF</p>', unsafe_allow_html=True)
-        uploaded = st.file_uploader("pdf", type=["pdf"], label_visibility="collapsed")
+        # Changing the key resets the widget, so a removed PDF is not re-indexed.
+        uploaded = st.file_uploader("pdf", type=["pdf"], label_visibility="collapsed",
+                                    key=f"uploader-{st.session_state.uploader_key}")
 
         if uploaded and not openai_key:
             st.warning("Add your OpenAI key to index the PDF.")
@@ -696,7 +785,8 @@ def main():
                         st.error(f"Embedding failed: {exc}. Check your OpenAI key and quota.")
                     else:
                         st.session_state.update(vector_store=store, pdf_key=key,
-                                                pdf_name=uploaded.name, history=[])
+                                                pdf_name=uploaded.name, history=[],
+                                                pdf_digest=pdf_digest(uploaded.getvalue()))
                         st.success(f"Indexed {uploaded.name}")
                         st.rerun()
 
@@ -720,7 +810,8 @@ def main():
         st.session_state.restore_tried = True
         restored = load_last_index(OpenAIEmbeddings(api_key=openai_key, model=EMBEDDING_MODEL))
         if restored:
-            st.session_state.update(vector_store=restored[0], pdf_name=restored[1], pdf_key=None)
+            st.session_state.update(vector_store=restored[0], pdf_name=restored[1],
+                                    pdf_digest=restored[2], pdf_key=None)
             st.rerun()
 
     if not st.session_state.vector_store:
@@ -730,8 +821,8 @@ def main():
     llm = get_llm(openai_key, model_name)
     agent = get_agent(openai_key, model_name, tavily_key)
 
-    for role, text, source, chunks, relevance, note in st.session_state.history:
-        render_message(role, text, source)
+    for i, (role, text, source, chunks, relevance, note) in enumerate(st.session_state.history):
+        render_message(role, text, source, idx=i)
         if role == "assistant":
             if note:
                 st.caption(note)
