@@ -228,3 +228,67 @@ def test_rate_limiter_threadsafe():
     ts = [threading.Thread(target=lambda: [rl.hit("k") for _ in range(100)]) for _ in range(8)]
     [t.start() for t in ts]; [t.join() for t in ts]
     assert len(rl._hits["k"]) == 800
+
+
+# ── chunk scoring / context selection / removal / markdown ───────────────────
+def test_chunks_carry_scores_best_first_and_store_untouched(store):
+    docs, best = app.retrieve_from_pdf("self attention transformer tokens", store)
+    scores = [d.metadata["score"] for d in docs]
+    assert scores == sorted(scores, reverse=True) and math.isclose(scores[0], best)
+    stored = list(store.docstore._dict.values())
+    assert all("score" not in d.metadata and "used" not in d.metadata for d in stored)
+
+
+def test_select_context_keeps_only_close_chunks():
+    from langchain_core.documents import Document
+    docs = [Document(page_content=str(s), metadata={"score": s}) for s in (0.60, 0.50, 0.44, 0.20)]
+    kept = app.select_context(docs, margin=0.15)
+    assert [d.metadata["score"] for d in kept] == [0.60, 0.50]
+    assert [d.metadata["used"] for d in docs] == [True, True, False, False]
+
+
+def test_select_context_always_keeps_best_and_handles_empty():
+    from langchain_core.documents import Document
+    assert app.select_context([]) == []
+    only = [Document(page_content="x", metadata={"score": 0.05})]
+    assert len(app.select_context(only)) == 1
+
+
+def test_orchestrate_sends_only_selected_chunks(store, monkeypatch):
+    seen = {}
+    def fake_answer(q, docs, llm):
+        seen["n"] = len(docs); return True, "ok (p. 2)"
+    monkeypatch.setattr(app, "answer_from_pdf", fake_answer)
+    r = app.orchestrate("self attention transformer tokens", store, None, None, [])
+    used = [c for c in r["chunks"] if c.metadata["used"]]
+    assert r["source"] == "pdf" and seen["n"] == len(used) >= 1
+    assert len(r["chunks"]) >= len(used)
+
+
+def test_remove_index_deletes_files_and_last_pointer(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "DATA_DIR", tmp_path)
+    pdf = make_pdf(PAGES)
+    app.index_pdf_cached(pdf, "paper.pdf", KeywordEmbeddings())
+    digest = app.pdf_digest(pdf)
+    assert app.load_last_index(KeywordEmbeddings())[2] == digest
+    app.remove_index(digest)
+    assert not (tmp_path / "indexes" / digest).exists()
+    assert app.load_last_index(KeywordEmbeddings()) is None
+
+
+def test_remove_index_keeps_pointer_to_other_pdf(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "DATA_DIR", tmp_path)
+    a, b = make_pdf(PAGES), make_pdf(PAGES[::-1])
+    app.index_pdf_cached(a, "a.pdf", KeywordEmbeddings())
+    app.index_pdf_cached(b, "b.pdf", KeywordEmbeddings())       # b is now "last"
+    app.remove_index(app.pdf_digest(a))
+    assert app.load_last_index(KeywordEmbeddings())[1] == "b.pdf"
+
+
+def test_remove_index_with_nothing_saved_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "DATA_DIR", tmp_path)
+    app.remove_index(None); app.remove_index("deadbeef")
+
+
+def test_answer_markdown_escapes_dollars_only():
+    assert app.answer_markdown("**Price** is $5 [link](https://x.y)") == "**Price** is \\$5 [link](https://x.y)"
