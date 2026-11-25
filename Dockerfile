@@ -4,6 +4,15 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     DATA_DIR=/data
 
+# Fixed dark theme so the UI looks the same whatever the browser's light/dark setting,
+# and hide Streamlit's developer toolbar from visitors.
+ENV STREAMLIT_THEME_BASE=dark \
+    STREAMLIT_THEME_PRIMARY_COLOR="#3b82f6" \
+    STREAMLIT_THEME_BACKGROUND_COLOR="#0f1117" \
+    STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR="#1e293b" \
+    STREAMLIT_THEME_TEXT_COLOR="#e2e8f0" \
+    STREAMLIT_CLIENT_TOOLBAR_MODE=viewer
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
